@@ -1,3 +1,4 @@
+# ────────────────────────── raporty_bot.py ──────────────────────────
 import os
 import json
 import asyncio
@@ -14,8 +15,7 @@ try:
     from office365.sharepoint.client_context import ClientContext
     from office365.runtime.auth.client_credential import ClientCredential
 except ModuleNotFoundError:
-    # biblioteka nieobecna → upload będzie pomijany
-    ClientContext = ClientCredential = None
+    ClientContext = ClientCredential = None  # biblioteka nieobecna → upload pomijamy
 
 # ───────────── Telegram ─────────────
 from telegram import (
@@ -26,13 +26,14 @@ from telegram import (
     BotCommand,
 )
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     ConversationHandler,
     filters,
+    Application,
 )
 
 # ──────────────────── konfiguracja ────────────────────
@@ -140,12 +141,12 @@ def format_report(entries: List[Dict[str, str]],
         ])
     return "\n".join(lines)
 
-# ──────────────────── handlery ────────────────────
+# ──────────────────── handlery (bez zmian w logice) ────────────────────
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     context.user_data["msg_ids"] = []
     date = datetime.now().strftime("%d.%m.%Y")
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
 
     create_text = "📋 Stwórz raport" if not report_exists(uid, date) else "✏️ Edytuj raport"
     cb_data     = "create"           if not report_exists(uid, date) else "edit"
@@ -299,7 +300,7 @@ async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     kb = [
         [InlineKeyboardButton("Dodaj kolejne miejsce", callback_data="again")],
-        [InlineKeyboardButton("Zakończ raport",       callback_data="finish")],
+        [InlineKeyboardButton("Zakończ raport",         callback_data="finish")],
     ]
     msg = await update.effective_chat.send_message("Co dalej?", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data["msg_ids"].append(msg.message_id)
@@ -353,28 +354,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Użyj /start do menu, /export do pobrania raportów lub /help po pomoc."
     )
 
-# ──────────────────── Application ────────────────────
+# ──────────────────── PTB Application ────────────────────
 async def on_startup(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start",   "Otwórz menu raportów"),
-        BotCommand("export",  "Eksportuj raporty"),
-        BotCommand("help",    "Pomoc"),
+        BotCommand("start",  "Otwórz menu raportów"),
+        BotCommand("export", "Eksportuj raporty"),
+        BotCommand("help",   "Pomoc"),
     ])
     if WEBHOOK_URL:  # webhook tylko w produkcji
         await app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
 
-def create_application() -> Application:
+def build_app() -> Application:
     app = (
-        Application.builder()
+        ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .post_init(on_startup)
         .build()
     )
 
     # komendy
-    app.add_handler(CommandHandler("start",   show_menu))
-    app.add_handler(CommandHandler("export",  export_handler))
-    app.add_handler(CommandHandler("help",    help_cmd))
+    app.add_handler(CommandHandler("start",  show_menu))
+    app.add_handler(CommandHandler("export", export_handler))
+    app.add_handler(CommandHandler("help",   help_cmd))
 
     # conversation
     conv = ConversationHandler(
@@ -396,32 +397,36 @@ def create_application() -> Application:
     return app
 
 # ──────────────────── Flask + stała pętla zdarzeń ────────────────────
-flask_app  = Flask(__name__)
-application = create_application()        # PTB Application
-bot: Bot = application.bot                # alias dla wygody
+flask_app = Flask(__name__)
+bot_app    = build_app()
+bot: Bot   = bot_app.bot  # alias
 
-# pojedyncza, żyjąca pętla dla całego workersa
+# Jedna pętla zdarzeń na cały worker Gunicorna
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
-loop.run_until_complete(application.initialize())   # jedno init przy starcie
+loop.run_until_complete(bot_app.initialize())
 
 @flask_app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook() -> str:
-    """Webhook Telegram → przetwarzamy Update w istniejącej pętli."""
+    """Odbiera Update z Telegrama i przekazuje do PTB w istniejącej pętli."""
     update = Update.de_json(request.get_json(force=True), bot)
-    # task w tej samej pętli; nie zamykamy jej po request-cie
-    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+    asyncio.run_coroutine_threadsafe(bot_app.process_update(update), loop)
     return "OK"
 
 @flask_app.route("/")
 def index() -> str:
     return "Bot działa!"
 
+# Gunicorn na Renderze spodziewa się zmiennej `app`
+app = flask_app
+
 # ────────── lokalnie (brak WEBHOOK_URL) ──────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    if not WEBHOOK_URL:            # tryb developerski – polling
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    else:                          # test webhooka lokalnie (np. ngrok)
-        flask_app.run(host="0.0.0.0", port=5000, debug=True)
+    if not WEBHOOK_URL:                     # tryb developerski – polling
+        bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    else:                                   # test webhooka lokalnie (np. ngrok)
+        bot_app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+        flask_app.run(host="0.0.0.0",
+                      port=int(os.getenv("PORT", 5000)))
