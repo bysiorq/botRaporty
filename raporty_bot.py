@@ -405,6 +405,20 @@ bot: Bot   = bot_app.bot  # alias
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 loop.run_until_complete(bot_app.initialize())
+# ── DODANE ───────────────────────────────────────────────────────────
+import threading
+
+# 1) uruchamiamy dispatcher PTB wewnątrz tej samej pętli
+loop.create_task(bot_app.start())
+
+# 2) a samą pętlę stawiamy w osobnym (daemonowym) wątku,
+#    żeby działała „na stałe” i obsługiwała zadania wrzucane
+#    przez telegram_webhook()
+threading.Thread(
+    target=loop.run_forever,
+    daemon=True
+).start()
+# ─────────────────────────────────────────────────────────────────────
 
 @flask_app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook() -> str:
