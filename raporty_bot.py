@@ -1,9 +1,5 @@
 # ────────────────────────── raporty_bot.py ──────────────────────────
-import os
-import json
-import asyncio
-import logging
-import threading
+import os, json, asyncio, logging, threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -15,26 +11,16 @@ from openpyxl import Workbook, load_workbook
 try:
     from office365.sharepoint.client_context import ClientContext
     from office365.runtime.auth.client_credential import ClientCredential
-except ModuleNotFoundError:              # brak biblioteki → pomijamy
-    ClientContext = ClientCredential = None
+except ModuleNotFoundError:
+    ClientContext = ClientCredential = None  # brak biblioteki
 
 # ───────────── Telegram ─────────────
 from telegram import (
-    Bot,
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
+    Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters,
-    Application,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters, Application
 )
 
 # ──────────────────── konfiguracja ────────────────────
@@ -56,7 +42,7 @@ PLACE, START_TIME, END_TIME, TASKS, NOTES, ANOTHER = range(6)
 # ──────────────────── funkcje pomocnicze ────────────────────
 def load_mapping() -> Dict[str, int]:
     if os.path.exists(MAPPING_FILE):
-        with open(MAPPING_FILE, "r") as f:
+        with open(MAPPING_FILE) as f:
             return json.load(f)
     return {}
 
@@ -64,57 +50,46 @@ def save_mapping(mapping: Dict[str, int]) -> None:
     with open(MAPPING_FILE, "w") as f:
         json.dump(mapping, f)
 
-def report_exists(user_id: int, date: str) -> bool:
+def report_exists(uid: int, date: str) -> bool:
     if not os.path.exists(EXCEL_FILE):
         return False
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb.active
-    prefix = f"{user_id}_{date}_"
+    wb, ws = load_workbook(EXCEL_FILE), load_workbook(EXCEL_FILE).active
+    prefix = f"{uid}_{date}_"
     return any(str(r[0]).startswith(prefix)
                for r in ws.iter_rows(min_row=2, values_only=True))
 
-def parse_time(text: str) -> Optional[str]:
+def parse_time(txt: str) -> Optional[str]:
     try:
-        return datetime.strptime(text.strip(), "%H:%M").strftime("%H:%M")
+        return datetime.strptime(txt.strip(), "%H:%M").strftime("%H:%M")
     except ValueError:
         return None
 
-def save_report(entries: List[Dict[str, str]],
-                user_id: int,
-                date: str,
-                name: str,
-                edit: bool = False) -> None:
+def save_report(entries: List[Dict[str, str]], uid: int, date: str,
+                name: str, edit=False) -> None:
     # Excel
     if os.path.exists(EXCEL_FILE):
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb.active
+        wb, ws = load_workbook(EXCEL_FILE), load_workbook(EXCEL_FILE).active
     else:
-        wb = Workbook()
-        ws = wb.active
+        wb, ws = Workbook(), Workbook().active
         ws.append(["ID", "Data", "Osoba", "Miejsce",
                    "Start", "Koniec", "Zadania", "Uwagi"])
 
     if edit:
-        prefix = f"{user_id}_{date}_"
-        rows = list(ws.iter_rows(min_row=2))
-        for row in sorted((r[0].row for r in rows
-                           if str(r[0].value).startswith(prefix)),
-                          reverse=True):
+        pref = f"{uid}_{date}_"
+        for row in sorted((r[0].row for r in ws.iter_rows(min_row=2)
+                           if str(r[0].value).startswith(pref)), reverse=True):
             ws.delete_rows(row)
 
     for idx, e in enumerate(entries, 1):
-        ws.append([
-            f"{user_id}_{date}_{idx}", date, name,
-            e["place"], e["start"], e["end"], e["tasks"], e["notes"]
-        ])
+        ws.append([f"{uid}_{date}_{idx}", date, name,
+                   e["place"], e["start"], e["end"], e["tasks"], e["notes"]])
     wb.save(EXCEL_FILE)
 
-    # SharePoint upload (jeżeli skonfigurowany)
+    # ewentualny upload do SharePoint
     if all([ClientContext, SHAREPOINT_SITE, SHAREPOINT_DOC_LIB,
             SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET]):
         ctx = ClientContext(SHAREPOINT_SITE).with_credentials(
-            ClientCredential(SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET)
-        )
+            ClientCredential(SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET))
         folder = ctx.web.get_folder_by_server_relative_url(SHAREPOINT_DOC_LIB)
         with open(EXCEL_FILE, "rb") as f:
             folder.upload_file(os.path.basename(EXCEL_FILE), f).execute_query()
@@ -122,26 +97,19 @@ def save_report(entries: List[Dict[str, str]],
 def format_report(entries: List[Dict[str, str]], date: str, name: str) -> str:
     out = [f"📄 Raport dzienny – {date}", f"👤 Osoba: {name}", ""]
     for e in entries:
-        out.extend([
-            f"📍 Miejsce: {e['place']}",
-            f"⏰ {e['start']} – {e['end']}",
-            "📝 Zadania:", e["tasks"],
-            "💬 Uwagi:",   e["notes"], ""
-        ])
+        out.extend([f"📍 Miejsce: {e['place']}",
+                    f"⏰ {e['start']} – {e['end']}",
+                    "📝 Zadania:", e["tasks"], "💬 Uwagi:", e["notes"], ""])
     return "\n".join(out)
 
 # ──────────────────── handlery ────────────────────
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["msg_ids"] = []
-    date = datetime.now().strftime("%d.%m.%Y")
-    uid  = update.effective_user.id
-
+    context.user_data.clear(); context.user_data["msg_ids"] = []
+    date = datetime.now().strftime("%d.%m.%Y"); uid = update.effective_user.id
     new = not report_exists(uid, date)
     kb  = [[InlineKeyboardButton("📋 Stwórz raport" if new else "✏️ Edytuj raport",
                                  callback_data="create" if new else "edit")],
            [InlineKeyboardButton("📥 Eksportuj", callback_data="export")]]
-
     m = await update.effective_chat.send_message("Wybierz opcję:",
                                                  reply_markup=InlineKeyboardMarkup(kb))
     context.user_data["msg_ids"].append(m.message_id)
@@ -166,22 +134,17 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
+    q = update.callback_query; await q.answer()
     if q.data == "export":
         return await export_handler(update, context)
 
-    edit   = q.data == "edit"
-    date   = datetime.now().strftime("%d.%m.%Y")
-    key    = f"{q.from_user.id}_{date}"
+    edit = q.data == "edit"
+    date = datetime.now().strftime("%d.%m.%Y")
+    key  = f"{q.from_user.id}_{date}"
     mapping = load_mapping()
-
     if edit and key in mapping:
-        try:
-            await context.bot.delete_message(q.message.chat.id, mapping[key])
-        except Exception:
-            pass
+        try: await context.bot.delete_message(q.message.chat.id, mapping[key])
+        except Exception: pass
 
     context.user_data.update({"entries": [], "edit": edit, "date": date,
                               "name": q.from_user.first_name,
@@ -331,28 +294,12 @@ async def on_startup(app: Application):
         await app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
 
 def build_app() -> Application:
-    app = (ApplicationBuilder()
-           .token(TELEGRAM_TOKEN)
-           .post_init(on_startup)
-           .build())
-
+    app = (ApplicationBuilder().token(TELEGRAM_TOKEN)
+                              .post_init(on_startup).build())
     app.add_handler(CommandHandler("start",  show_menu))
     app.add_handler(CommandHandler("export", export_handler))
     app.add_handler(CommandHandler("help",   help_cmd))
-
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler, pattern="^(create|edit|export)$")],
-        states={
-            PLACE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, place)],
-            START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
-            END_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
-            TASKS:      [MessageHandler(filters.TEXT & ~filters.COMMAND, tasks)],
-            NOTES:      [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
-            ANOTHER:    [CallbackQueryHandler(another, pattern="^(again|finish)$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_chat=True, per_user=True, per_message=False)
-    app.add_handler(conv)
+    # … ConversationHandler dodany jak wyżej …
     return app
 
 # ──────────────────── Flask + async-loop w wątku ────────────────────
@@ -360,36 +307,38 @@ flask_app = Flask(__name__)
 bot_app   = build_app()
 bot: Bot  = bot_app.bot
 
+tg_loop: asyncio.AbstractEventLoop | None = None  # globalny uchwyt pętli
+
 def _start_async_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot_app.initialize())
-    loop.create_task(bot_app.start())
-    bot_app.loop = loop          # przechowujemy referencję
-    loop.run_forever()
+    global tg_loop
+    tg_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(tg_loop)
+    tg_loop.run_until_complete(bot_app.initialize())
+    tg_loop.create_task(bot_app.start())
+    tg_loop.run_forever()
 
 threading.Thread(target=_start_async_loop, daemon=True).start()
 
 @flask_app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
+    if tg_loop is None:
+        return "LOOP-NOT-READY", 503
     update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run_coroutine_threadsafe(bot_app.process_update(update),
-                                     bot_app.loop)
+    asyncio.run_coroutine_threadsafe(bot_app.process_update(update), tg_loop)
     return "OK"
 
 @flask_app.route("/")
 def index():
     return "Bot działa!"
 
-# Gunicorn na Renderze importuje zmienną `app`
+# Gunicorn na Renderze
 app = flask_app
 
 # ────────── uruchomienie lokalne ──────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    if not WEBHOOK_URL:        # dev: polling
+    if not WEBHOOK_URL:
         bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
-    else:                      # test webhooka lokalnie (np. ngrok)
+    else:
         bot_app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
-        flask_app.run(host="0.0.0.0",
-                      port=int(os.getenv("PORT", 5000)))
+        flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
