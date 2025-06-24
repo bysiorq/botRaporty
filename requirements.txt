@@ -1,8 +1,5 @@
-python-telegram-bot==21.4
-Flask==3.0.3
+python-telegram-bot[webhooks]==21.4   # wciąga aiohttp >=3.9  
 python-dotenv==1.0.1
 openpyxl==3.1.2
-office365-rest-python-client==2.5.0
-httpx==0.27.0
-Werkzeug==3.0.3
-gunicorn==22.0.0
+Office365-REST-Python-Client==2.5.0   # jeśli używasz SharePoint
+gunicorn==22.0.0                      # Render automatycznie dorzuca, ale nie zaszkodzi
