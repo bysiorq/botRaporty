@@ -1,10 +1,11 @@
 # ────────────────────────── raporty_bot.py ──────────────────────────
-import os, json, asyncio, logging, threading
+import os
+import json
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from flask import Flask, request
 from openpyxl import Workbook, load_workbook
 
 # ───────────── SharePoint (opcjonalny upload) ─────────────
@@ -12,22 +13,34 @@ try:
     from office365.sharepoint.client_context import ClientContext
     from office365.runtime.auth.client_credential import ClientCredential
 except ModuleNotFoundError:
-    ClientContext = ClientCredential = None  # brak biblioteki
+    ClientContext = ClientCredential = None          # brak biblioteki → upload pomijamy
 
 # ───────────── Telegram ─────────────
 from telegram import (
-    Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+    Bot,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, ConversationHandler, filters, Application
+    ApplicationBuilder,
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
 )
 
 # ──────────────────── konfiguracja ────────────────────
 load_dotenv()
 
-TELEGRAM_TOKEN           = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL              = os.getenv("WEBHOOK_URL")            # pusty → polling
+TELEGRAM_TOKEN           = os.getenv("TELEGRAM_TOKEN")               # MUST HAVE
+WEBHOOK_URL              = os.getenv("WEBHOOK_URL", "").rstrip("/")  # np. https://botraporty.onrender.com
+PORT                     = int(os.getenv("PORT", 8443))              # Render ustawia PORT automatycznie
+# opcjonalne ustawienia SharePoint
 SHAREPOINT_SITE          = os.getenv("SHAREPOINT_SITE")
 SHAREPOINT_DOC_LIB       = os.getenv("SHAREPOINT_DOC_LIB")
 SHAREPOINT_CLIENT_ID     = os.getenv("SHAREPOINT_CLIENT_ID")
@@ -42,7 +55,7 @@ PLACE, START_TIME, END_TIME, TASKS, NOTES, ANOTHER = range(6)
 # ──────────────────── funkcje pomocnicze ────────────────────
 def load_mapping() -> Dict[str, int]:
     if os.path.exists(MAPPING_FILE):
-        with open(MAPPING_FILE) as f:
+        with open(MAPPING_FILE, "r") as f:
             return json.load(f)
     return {}
 
@@ -50,135 +63,186 @@ def save_mapping(mapping: Dict[str, int]) -> None:
     with open(MAPPING_FILE, "w") as f:
         json.dump(mapping, f)
 
-def report_exists(uid: int, date: str) -> bool:
+def report_exists(user_id: int, date: str) -> bool:
     if not os.path.exists(EXCEL_FILE):
         return False
-    wb, ws = load_workbook(EXCEL_FILE), load_workbook(EXCEL_FILE).active
-    prefix = f"{uid}_{date}_"
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb.active
+    prefix = f"{user_id}_{date}_"
     return any(str(r[0]).startswith(prefix)
                for r in ws.iter_rows(min_row=2, values_only=True))
 
-def parse_time(txt: str) -> Optional[str]:
+def parse_time(text: str) -> Optional[str]:
     try:
-        return datetime.strptime(txt.strip(), "%H:%M").strftime("%H:%M")
+        t = datetime.strptime(text.strip(), "%H:%M")
+        return t.strftime("%H:%M")
     except ValueError:
         return None
 
-def save_report(entries: List[Dict[str, str]], uid: int, date: str,
-                name: str, edit=False) -> None:
+def save_report(entries: List[Dict[str, str]],
+                user_id: int,
+                date: str,
+                name: str,
+                edit: bool = False) -> None:
+
     # Excel
     if os.path.exists(EXCEL_FILE):
-        wb, ws = load_workbook(EXCEL_FILE), load_workbook(EXCEL_FILE).active
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb.active
     else:
-        wb, ws = Workbook(), Workbook().active
+        wb = Workbook()
+        ws = wb.active
         ws.append(["ID", "Data", "Osoba", "Miejsce",
                    "Start", "Koniec", "Zadania", "Uwagi"])
 
     if edit:
-        pref = f"{uid}_{date}_"
-        for row in sorted((r[0].row for r in ws.iter_rows(min_row=2)
-                           if str(r[0].value).startswith(pref)), reverse=True):
-            ws.delete_rows(row)
+        prefix = f"{user_id}_{date}_"
+        rows = list(ws.iter_rows(min_row=2))
+        idxs = [row[0].row for row in rows if str(row[0].value).startswith(prefix)]
+        for i in sorted(idxs, reverse=True):
+            ws.delete_rows(i)
 
-    for idx, e in enumerate(entries, 1):
-        ws.append([f"{uid}_{date}_{idx}", date, name,
-                   e["place"], e["start"], e["end"], e["tasks"], e["notes"]])
+    for idx, e in enumerate(entries, start=1):
+        ws.append([
+            f"{user_id}_{date}_{idx}",
+            date,
+            name,
+            e["place"],
+            e["start"],
+            e["end"],
+            e["tasks"],
+            e["notes"],
+        ])
     wb.save(EXCEL_FILE)
 
-    # ewentualny upload do SharePoint
+    # SharePoint upload (jeśli biblioteka i zmienne są dostępne)
     if all([ClientContext, SHAREPOINT_SITE, SHAREPOINT_DOC_LIB,
             SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET]):
         ctx = ClientContext(SHAREPOINT_SITE).with_credentials(
-            ClientCredential(SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET))
+            ClientCredential(SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET)
+        )
         folder = ctx.web.get_folder_by_server_relative_url(SHAREPOINT_DOC_LIB)
         with open(EXCEL_FILE, "rb") as f:
             folder.upload_file(os.path.basename(EXCEL_FILE), f).execute_query()
 
-def format_report(entries: List[Dict[str, str]], date: str, name: str) -> str:
-    out = [f"📄 Raport dzienny – {date}", f"👤 Osoba: {name}", ""]
+def format_report(entries: List[Dict[str, str]],
+                  date: str,
+                  name: str) -> str:
+    lines = [f"📄 Raport dzienny – {date}", f"👤 Osoba: {name}", ""]
     for e in entries:
-        out.extend([f"📍 Miejsce: {e['place']}",
-                    f"⏰ {e['start']} – {e['end']}",
-                    "📝 Zadania:", e["tasks"], "💬 Uwagi:", e["notes"], ""])
-    return "\n".join(out)
+        lines.extend([
+            f"📍 Miejsce: {e['place']}",
+            f"⏰ {e['start']} – {e['end']}",
+            "📝 Zadania:",
+            e["tasks"],
+            "💬 Uwagi:",
+            e["notes"],
+            "",
+        ])
+    return "\n".join(lines)
 
 # ──────────────────── handlery ────────────────────
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear(); context.user_data["msg_ids"] = []
-    date = datetime.now().strftime("%d.%m.%Y"); uid = update.effective_user.id
-    new = not report_exists(uid, date)
-    kb  = [[InlineKeyboardButton("📋 Stwórz raport" if new else "✏️ Edytuj raport",
-                                 callback_data="create" if new else "edit")],
-           [InlineKeyboardButton("📥 Eksportuj", callback_data="export")]]
-    m = await update.effective_chat.send_message("Wybierz opcję:",
-                                                 reply_markup=InlineKeyboardMarkup(kb))
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["msg_ids"] = []
+    date = datetime.now().strftime("%d.%m.%Y")
+    uid  = update.effective_user.id
+
+    create_text = "📋 Stwórz raport" if not report_exists(uid, date) else "✏️ Edytuj raport"
+    cb_data     = "create"           if not report_exists(uid, date) else "edit"
+
+    kb = [
+        [InlineKeyboardButton(create_text, callback_data=cb_data)],
+        [InlineKeyboardButton("📥 Eksportuj", callback_data="export")],
+    ]
+
+    m = await update.effective_chat.send_message(
+        "Wybierz opcję:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
     context.user_data["msg_ids"].append(m.message_id)
 
-async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
         await update.callback_query.answer()
-        cid = update.callback_query.message.chat.id
+        chat_id = update.callback_query.message.chat.id
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
     else:
-        cid = update.effective_chat.id
+        chat_id = update.effective_chat.id
 
     if not os.path.exists(EXCEL_FILE):
-        msg = await context.bot.send_message(cid, "⚠️ Brak pliku raportów.")
+        msg = await context.bot.send_message(chat_id, "⚠️ Brak pliku raportów.")
         context.user_data.setdefault("msg_ids", []).append(msg.message_id)
     else:
         with open(EXCEL_FILE, "rb") as f:
             doc = await context.bot.send_document(
-                cid, f, filename=EXCEL_FILE,
-                caption=f"Raporty za {datetime.now().strftime('%m.%Y')}")
+                chat_id,
+                f,
+                filename=EXCEL_FILE,
+                caption=f"Raporty za {datetime.now().strftime('%m.%Y')}",
+            )
             context.user_data.setdefault("msg_ids", []).append(doc.message_id)
     return ConversationHandler.END
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if q.data == "export":
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "export":
         return await export_handler(update, context)
 
-    edit = q.data == "edit"
+    edit_flag = data == "edit"
     date = datetime.now().strftime("%d.%m.%Y")
-    key  = f"{q.from_user.id}_{date}"
+    key  = f"{query.from_user.id}_{date}"
+
     mapping = load_mapping()
-    if edit and key in mapping:
-        try: await context.bot.delete_message(q.message.chat.id, mapping[key])
-        except Exception: pass
+    if edit_flag and key in mapping:
+        try:
+            await context.bot.delete_message(query.message.chat.id, mapping[key])
+        except Exception:
+            pass
 
-    context.user_data.update({"entries": [], "edit": edit, "date": date,
-                              "name": q.from_user.first_name,
-                              "msg_ids": context.user_data.get("msg_ids", [])})
-
-    await q.edit_message_reply_markup(reply_markup=None)
-    m = await context.bot.send_message(q.message.chat.id,
-                                       "📍 Podaj miejsce wykonywania pracy:",
-                                       allow_sending_without_reply=True)
-    context.user_data["msg_ids"].append(m.message_id)
+    context.user_data.update(
+        {
+            "entries": [],
+            "edit": edit_flag,
+            "date": date,
+            "name": query.from_user.first_name,
+            "msg_ids": context.user_data.get("msg_ids", []),
+        }
+    )
+    await query.edit_message_reply_markup(reply_markup=None)
+    msg = await context.bot.send_message(
+        chat_id=query.message.chat.id,
+        text="📍 Podaj miejsce wykonywania pracy:",
+        allow_sending_without_reply=True,
+    )
+    context.user_data["msg_ids"].append(msg.message_id)
     return PLACE
 
-async def place(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["msg_ids"].append(update.message.message_id)
     await update.message.delete()
+    place = update.message.text.strip()
 
-    txt = update.message.text.strip()
-    if not txt:
+    if not place:
         err = await update.effective_chat.send_message("Podaj poprawne miejsce.")
         context.user_data["msg_ids"].append(err.message_id)
         return PLACE
 
-    context.user_data["place"] = txt
+    context.user_data["place"] = place
     ask = await update.effective_chat.send_message(
         "⏰ Podaj godzinę rozpoczęcia pracy (HH:MM):")
     context.user_data["msg_ids"].append(ask.message_id)
     return START_TIME
 
-async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["msg_ids"].append(update.message.message_id)
     await update.message.delete()
-
     t = parse_time(update.message.text or "")
     last_end = context.user_data["entries"][-1]["end"] if context.user_data["entries"] else None
+
     if not t or (last_end and t <= last_end):
         err = await update.effective_chat.send_message("⏰ Błędna godzina. Spróbuj ponownie.")
         context.user_data["msg_ids"].append(err.message_id)
@@ -190,10 +254,10 @@ async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["msg_ids"].append(ask.message_id)
     return END_TIME
 
-async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["msg_ids"].append(update.message.message_id)
-
     t = parse_time(update.message.text or "")
+
     if not t or t <= context.user_data.get("start"):
         err = await update.effective_chat.send_message("⏰ Błędna godzina. Spróbuj ponownie.")
         context.user_data["msg_ids"].append(err.message_id)
@@ -204,141 +268,152 @@ async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["msg_ids"].append(ask.message_id)
     return TASKS
 
-async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["msg_ids"].append(update.message.message_id)
     txt = update.message.text.strip()
+
     if not txt:
         err = await update.effective_chat.send_message("📝 Lista zadań nie może być pusta.")
         context.user_data["msg_ids"].append(err.message_id)
         return TASKS
 
     context.user_data["tasks"] = txt
-    ask = await update.effective_chat.send_message(
-        "💬 Dodaj uwagi lub wpisz '-' jeśli brak:")
+    ask = await update.effective_chat.send_message("💬 Dodaj uwagi lub wpisz '-' jeśli brak:")
     context.user_data["msg_ids"].append(ask.message_id)
     return NOTES
 
-async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["msg_ids"].append(update.message.message_id)
     txt = update.message.text.strip()
+
     if not txt:
         err = await update.effective_chat.send_message("💬 Uwagi nie mogą być puste.")
         context.user_data["msg_ids"].append(err.message_id)
         return NOTES
 
-    context.user_data["entries"].append({
+    entry = {
         "place": context.user_data.pop("place"),
         "start": context.user_data.pop("start"),
         "end":   context.user_data.pop("end"),
         "tasks": context.user_data.pop("tasks"),
         "notes": txt,
-    })
+    }
+    context.user_data["entries"].append(entry)
 
-    kb = [[InlineKeyboardButton("Dodaj kolejne miejsce", callback_data="again")],
-          [InlineKeyboardButton("Zakończ raport",        callback_data="finish")]]
-    m = await update.effective_chat.send_message("Co dalej?",
-                                                 reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data["msg_ids"].append(m.message_id)
+    kb = [
+        [InlineKeyboardButton("Dodaj kolejne miejsce", callback_data="again")],
+        [InlineKeyboardButton("Zakończ raport",         callback_data="finish")],
+    ]
+    msg = await update.effective_chat.send_message(
+        "Co dalej?", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data["msg_ids"].append(msg.message_id)
     return ANOTHER
 
-async def another(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def another(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
 
-    if q.data == "again":
-        await q.edit_message_reply_markup()
-        ask = await q.message.chat.send_message("📍 Podaj miejsce wykonywania pracy:",
-                                                allow_sending_without_reply=True)
+    if query.data == "again":
+        await query.edit_message_reply_markup()
+        ask = await query.message.chat.send_message(
+            "📍 Podaj miejsce wykonywania pracy:",
+            allow_sending_without_reply=True,
+        )
         context.user_data["msg_ids"].append(ask.message_id)
         return PLACE
 
     # finish
     for mid in context.user_data.get("msg_ids", []):
         try:
-            await q.message.chat.delete_message(mid)
+            await query.message.chat.delete_message(mid)
         except Exception:
             pass
 
-    save_report(context.user_data["entries"],
-                q.from_user.id,
-                context.user_data["date"],
-                context.user_data["name"],
-                edit=context.user_data.get("edit", False))
+    save_report(
+        context.user_data["entries"],
+        query.from_user.id,
+        context.user_data["date"],
+        context.user_data["name"],
+        edit=context.user_data.get("edit", False),
+    )
 
     rpt = format_report(context.user_data["entries"],
                         context.user_data["date"],
                         context.user_data["name"])
-    msg = await q.message.chat.send_message(rpt)
+
+    msg = await query.message.chat.send_message(rpt)
 
     mapping = load_mapping()
-    mapping[f"{q.from_user.id}_{context.user_data['date']}"] = msg.message_id
+    mapping[f"{query.from_user.id}_{context.user_data['date']}"] = msg.message_id
     save_mapping(mapping)
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.effective_chat.send_message("Anulowano.")
     return ConversationHandler.END
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(
-        "Użyj /start do menu, /export do pobrania raportów lub /help po pomoc.")
+        "Użyj /start do menu, /export do pobrania raportów lub /help po pomoc."
+    )
 
 # ──────────────────── PTB Application ────────────────────
-async def on_startup(app: Application):
+async def on_startup(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start",  "Otwórz menu raportów"),
         BotCommand("export", "Eksportuj raporty"),
         BotCommand("help",   "Pomoc"),
     ])
-    if WEBHOOK_URL:
-        await app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
 
 def build_app() -> Application:
-    app = (ApplicationBuilder().token(TELEGRAM_TOKEN)
-                              .post_init(on_startup).build())
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
+
+    # komendy
     app.add_handler(CommandHandler("start",  show_menu))
     app.add_handler(CommandHandler("export", export_handler))
     app.add_handler(CommandHandler("help",   help_cmd))
-    # … ConversationHandler dodany jak wyżej …
+
+    # conversation
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(menu_handler, pattern="^(create|edit|export)$")],
+        states={
+            PLACE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, place)],
+            START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
+            END_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
+            TASKS:      [MessageHandler(filters.TEXT & ~filters.COMMAND, tasks)],
+            NOTES:      [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
+            ANOTHER:    [CallbackQueryHandler(another, pattern="^(again|finish)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_chat=True,
+        per_user=True,
+        per_message=False,
+    )
+    app.add_handler(conv)
     return app
 
-# ──────────────────── Flask + async-loop w wątku ────────────────────
-flask_app = Flask(__name__)
-bot_app   = build_app()
-bot: Bot  = bot_app.bot
-
-tg_loop: asyncio.AbstractEventLoop | None = None  # globalny uchwyt pętli
-
-def _start_async_loop():
-    global tg_loop
-    tg_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(tg_loop)
-    tg_loop.run_until_complete(bot_app.initialize())
-    tg_loop.create_task(bot_app.start())
-    tg_loop.run_forever()
-
-threading.Thread(target=_start_async_loop, daemon=True).start()
-
-@flask_app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    if tg_loop is None:
-        return "LOOP-NOT-READY", 503
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run_coroutine_threadsafe(bot_app.process_update(update), tg_loop)
-    return "OK"
-
-@flask_app.route("/")
-def index():
-    return "Bot działa!"
-
-# Gunicorn na Renderze
-app = flask_app
-
-# ────────── uruchomienie lokalne ──────────
+# ──────────────────── main ────────────────────
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    if not WEBHOOK_URL:
-        bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    )
+
+    bot_app = build_app()
+
+    if WEBHOOK_URL:
+        # produkcja (Render) – webhook
+        bot_app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+        )
     else:
-        bot_app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
-        flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+        # lokalnie – polling
+        bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
