@@ -1,4 +1,4 @@
-
+# ────────────────────────── raporty_bot.py (refactor 2025-08; sticky + lock fix + DATA_DIR + presets(miejsca) + calendar + exports + backups + validation + tags + summaries + safe_answer) ──────────────────────────
 import os
 import re
 import json
@@ -73,20 +73,18 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().
 HEADERS = [
     "ID",        # unikalny klucz: {user_id}_{dd.mm.YYYY}_{idx}
     "Data",
-    "Imię",      # <- zamiast "Osoba"
+    "Imię",
     "Miejsce",
     "Start",
     "Koniec",
     "Zadania",
     "Uwagi",
 ]
-COLS = {name: i + 1 for i, name in enumerate(HEADERS)}  # 1-based indexy kolumn
+COLS = {name: i + 1 for i, name in enumerate(HEADERS)}  # 1-based indexy
 
 # ──────────────────── stany konwersacji ────────────────────
 PLACE, START_TIME, END_TIME, TASKS, NOTES, ANOTHER = range(6)
-# stany edycji
 SELECT_ENTRY, SELECT_FIELD, EDIT_VALUE, EDIT_MORE = range(6, 10)
-# wybór daty i decyzja o overlapie
 DATE_PICK, OVERLAP_DECIDE = range(10, 12)
 
 # ──────────────────── helpers: excel/lock/backup ────────────────────
@@ -96,11 +94,9 @@ def _atomic_save_wb(wb: Workbook, path: str) -> None:
     wb.save(tmp_path)
     os.replace(tmp_path, path)
 
-
 def _with_lock(fn, *args, **kwargs):
     with portalocker.Lock(LOCK_FILE, timeout=30):
         return fn(*args, **kwargs)
-
 
 def _backup_file():
     if not os.path.exists(EXCEL_FILE):
@@ -111,7 +107,6 @@ def _backup_file():
         shutil.copy2(EXCEL_FILE, dst)
     except Exception as e:
         logging.warning("Backup failed: %s", e)
-    # rotacja
     files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("reports_") and f.endswith(".xlsx")])
     if len(files) > BACKUP_KEEP:
         for old in files[: len(files) - BACKUP_KEEP]:
@@ -120,42 +115,31 @@ def _backup_file():
             except Exception:
                 pass
 
-
 def open_wb() -> Workbook:
-    def _open():
-        if os.path.exists(EXCEL_FILE):
-            return load_workbook(EXCEL_FILE)
-        wb = Workbook()
-        return wb
-    return _with_lock(_open)
-
+    """UWAGA: bez locka (lock nakładamy w operacjach wyższego poziomu, by uniknąć zagnieżdżeń)."""
+    if os.path.exists(EXCEL_FILE):
+        return load_workbook(EXCEL_FILE)
+    return Workbook()
 
 def month_key_from_date(date_str: str) -> str:
     d = datetime.strptime(date_str, "%d.%m.%Y")
     return f"{d.year:04d}-{d.month:02d}"
 
-
 def ensure_month_sheet(wb: Workbook, month_key: str) -> Worksheet:
-    """Zwraca arkusz dla danego miesiąca. Tworzy jeśli nie istnieje i ustawia nagłówki.
-    Nowy miesiąc ląduje jako pierwszy arkusz (na górze)."""
     ws: Optional[Worksheet] = wb[month_key] if month_key in wb.sheetnames else None
     if ws is None:
-        ws = wb.create_sheet(title=month_key, index=0)  # na górze
+        ws = wb.create_sheet(title=month_key, index=0)
         ws.append(HEADERS)
-        # usuń domyślny "Sheet" jeśli pusty
         if "Sheet" in wb.sheetnames and wb["Sheet"].max_row == 1 and wb["Sheet"].max_column == 1:
             wb.remove(wb["Sheet"])
     else:
-        # przenieś na początek
         idx = wb.sheetnames.index(month_key)
         if idx != 0:
             wb.move_sheet(ws, offset=-idx)
     return ws
 
-
 def get_month_sheet_if_exists(wb: Workbook, month_key: str) -> Optional[Worksheet]:
     return wb[month_key] if month_key in wb.sheetnames else None
-
 
 def report_exists(user_id: int, date_str: str) -> bool:
     if not os.path.exists(EXCEL_FILE):
@@ -172,11 +156,10 @@ def report_exists(user_id: int, date_str: str) -> bool:
         return False
     return _with_lock(_exists)
 
-
 def save_report(entries: List[Dict[str, str]], user_id: int, date_str: str, name: str) -> None:
-    """Dopisuje nowe wpisy na dany dzień (append). Indeksy kontynuowane. Edycje pól robi update_report_field()."""
+    """Append nowych wpisów na dany dzień. Indeks kontynuowany."""
     def _save():
-        wb = open_wb()  # już w locku
+        wb = open_wb()  # UWAGA: open_wb bez locka, ale całość jest w _with_lock
         ws = ensure_month_sheet(wb, month_key_from_date(date_str))
         prefix = f"{user_id}_{date_str}_"
         existing_idxs: List[int] = []
@@ -206,7 +189,6 @@ def save_report(entries: List[Dict[str, str]], user_id: int, date_str: str, name
     _with_lock(_save)
     _maybe_upload_sharepoint()
 
-
 def read_entries_for_day(user_id: int, date_str: str) -> List[Dict[str, str]]:
     if not os.path.exists(EXCEL_FILE):
         return []
@@ -235,7 +217,6 @@ def read_entries_for_day(user_id: int, date_str: str) -> List[Dict[str, str]]:
         return out
     return _with_lock(_read)
 
-
 def read_entries_all_weeks(user_id: int) -> List[Dict[str, str]]:
     if not os.path.exists(EXCEL_FILE):
         return []
@@ -244,7 +225,6 @@ def read_entries_all_weeks(user_id: int) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            # pomiń puste arkusze
             if ws.max_row < 2:
                 continue
             for row in ws.iter_rows(min_row=2, values_only=False):
@@ -258,7 +238,6 @@ def read_entries_all_weeks(user_id: int) -> List[Dict[str, str]]:
                     })
         return out
     return _with_lock(_read_all)
-
 
 def update_report_field(user_id: int, date_str: str, rid: str, field: str, new_value: str) -> None:
     def _upd():
@@ -285,7 +264,6 @@ def update_report_field(user_id: int, date_str: str, rid: str, field: str, new_v
     _with_lock(_upd)
     _maybe_upload_sharepoint()
 
-
 def _maybe_upload_sharepoint() -> None:
     if all([ClientContext, SHAREPOINT_SITE, SHAREPOINT_DOC_LIB, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET]):
         try:
@@ -298,18 +276,16 @@ def _maybe_upload_sharepoint() -> None:
         except Exception as e:
             logging.warning("SharePoint upload failed: %s", e)
 
-# ──────────────────── helpers: mapping/presets/utils ────────────────────
+# ──────────────────── helpers: mapping/presets(utils) ────────────────────
 def load_mapping() -> Dict[str, int]:
     if os.path.exists(MAPPING_FILE):
         with open(MAPPING_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-
 def save_mapping(mapping: Dict[str, int]) -> None:
     with open(MAPPING_FILE, "w", encoding="utf-8") as f:
         json.dump(mapping, f)
-
 
 def load_presets() -> Dict[str, Dict[str, List[str]]]:
     if os.path.exists(PRESETS_FILE):
@@ -320,17 +296,16 @@ def load_presets() -> Dict[str, Dict[str, List[str]]]:
                 return {}
     return {}
 
-
 def save_presets(presets: Dict[str, Dict[str, List[str]]]) -> None:
     with open(PRESETS_FILE, "w", encoding="utf-8") as f:
         json.dump(presets, f, ensure_ascii=False)
-
 
 def remember_place(user_id: int, place: str) -> None:
     def _upd():
         presets = load_presets()
         key = str(user_id)
-        user = presets.setdefault(key, {"places": [], "tasks": []})
+        # tylko presety MIEJSC
+        user = presets.setdefault(key, {"places": []})
         if place in user["places"]:
             user["places"].remove(place)
         user["places"].insert(0, place)
@@ -338,33 +313,11 @@ def remember_place(user_id: int, place: str) -> None:
         save_presets(presets)
     _with_lock(_upd)
 
-
-def remember_tasks(user_id: int, tasks: str) -> None:
-    def _upd():
-        presets = load_presets()
-        key = str(user_id)
-        user = presets.setdefault(key, {"places": [], "tasks": []})
-        t = tasks.strip()
-        if not t:
-            return
-        if t in user["tasks"]:
-            user["tasks"].remove(t)
-        user["tasks"].insert(0, t)
-        user["tasks"] = user["tasks"][:5]
-        save_presets(presets)
-    _with_lock(_upd)
-
-
 def get_recent_places(user_id: int) -> List[str]:
     presets = load_presets()
     return presets.get(str(user_id), {}).get("places", [])
 
-
-def get_task_templates(user_id: int) -> List[str]:
-    presets = load_presets()
-    return presets.get(str(user_id), {}).get("tasks", [])
-
-
+# ──────────────────── helpers: time/tags/overlap ────────────────────
 def parse_time(text: str) -> Optional[str]:
     try:
         t = datetime.strptime(text.strip(), "%H:%M")
@@ -372,33 +325,26 @@ def parse_time(text: str) -> Optional[str]:
     except Exception:
         return None
 
-
 def time_to_minutes(t: str) -> int:
     h, m = map(int, t.split(":"))
     return h * 60 + m
-
 
 def minutes_to_hhmm(m: int) -> str:
     h = m // 60
     mm = m % 60
     return f"{h}h {mm:02d}m"
 
-
 def extract_tags(text: str) -> List[str]:
     return re.findall(r"#[\wąćęłńóśżźĄĆĘŁŃÓŚŻŹ]+", text or "")
-
 
 def intervals_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
     return max(time_to_minutes(a_start), time_to_minutes(b_start)) < min(time_to_minutes(a_end), time_to_minutes(b_end))
 
-
 def has_overlap(user_id: int, date_str: str, start: str, end: str, exclude_rid: Optional[str] = None, in_memory: Optional[List[Dict]] = None) -> Tuple[bool, List[Tuple[str, str]]]:
     conflicts = []
-    # in-memory (z aktualnej sesji)
     for e in (in_memory or []):
         if intervals_overlap(start, end, e["start"], e["end"]):
             conflicts.append((e["start"], e["end"]))
-    # z pliku
     for e in read_entries_for_day(user_id, date_str):
         if exclude_rid and e["rid"] == exclude_rid:
             continue
@@ -406,14 +352,12 @@ def has_overlap(user_id: int, date_str: str, start: str, end: str, exclude_rid: 
             conflicts.append((e["start"], e["end"]))
     return (len(conflicts) > 0, conflicts)
 
-
 def compute_daily_minutes(entries: List[Dict[str, str]]) -> int:
     total = 0
     for e in entries:
         if e["start"] and e["end"]:
             total += time_to_minutes(e["end"]) - time_to_minutes(e["start"])
     return total
-
 
 def compute_week_minutes(user_id: int, any_date_ddmmYYYY: str) -> int:
     d = datetime.strptime(any_date_ddmmYYYY, "%d.%m.%Y").date()
@@ -428,7 +372,6 @@ def compute_week_minutes(user_id: int, any_date_ddmmYYYY: str) -> int:
         if (y, w) == (iso_year, iso_week) and e["start"] and e["end"]:
             total += time_to_minutes(e["end"]) - time_to_minutes(e["start"])
     return total
-
 
 def format_report(entries: List[Dict[str, str]], date_str: str, name: str, with_totals: bool = False, uid: Optional[int] = None) -> str:
     lines = [f"📄 Raport dzienny – {date_str}", f"👤 Imię: {name}", ""]
@@ -454,7 +397,7 @@ def format_report(entries: List[Dict[str, str]], date_str: str, name: str, with_
         lines.append(f"➕ Razem dziś: {minutes_to_hhmm(day_min)} | Tydzień: {minutes_to_hhmm(week_min)}")
     return "\n".join(lines)
 
-# ──────────────────── helpers: sticky + menu + calendar ────────────────────
+# ──────────────────── helpers: Telegram (sticky/safe_answer) ────────────────────
 async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     chat = update_or_ctx.effective_chat if isinstance(update_or_ctx, Update) else None
     chat_id = chat.id if chat else update_or_ctx.callback_query.message.chat.id
@@ -471,7 +414,6 @@ async def sticky_set(update_or_ctx, context: ContextTypes.DEFAULT_TYPE, text: st
     m = await context.bot.send_message(chat_id, text, reply_markup=reply_markup)
     context.user_data["sticky_id"] = m.message_id
 
-
 async def sticky_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     sticky_id = context.user_data.get("sticky_id")
     if sticky_id:
@@ -481,18 +423,20 @@ async def sticky_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             pass
         context.user_data.pop("sticky_id", None)
 
+async def safe_answer(q):
+    try:
+        await q.answer()
+    except BadRequest:
+        pass
+    except Exception:
+        pass
 
+# ──────────────────── menu + kalendarz ────────────────────
 def today_str() -> str:
     return datetime.now().strftime("%d.%m.%Y")
 
-
-def yesterday_str() -> str:
-    return (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
-
-
 def to_ddmmyyyy(d: date) -> str:
     return d.strftime("%d.%m.%Y")
-
 
 def build_main_menu(uid: int, date_str: str) -> InlineKeyboardMarkup:
     create_text = "📋 Stwórz raport" if not report_exists(uid, date_str) else "✏️ Edytuj raport"
@@ -504,26 +448,21 @@ def build_main_menu(uid: int, date_str: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(kb)
 
-
 def month_kb(year: int, month: int) -> InlineKeyboardMarkup:
     month_name = cal.month_name[month]
-    days = cal.monthcalendar(year, month)  # tygodnie z dniami, 0 = brak dnia
+    days = cal.monthcalendar(year, month)
     rows = []
-    # nagłówek
     rows.append([InlineKeyboardButton(f"{month_name} {year}", callback_data="noop")])
-    # dni tygodnia
     rows.append([InlineKeyboardButton(x, callback_data="noop") for x in ["Pn","Wt","Śr","Cz","Pt","So","Nd"]])
-    # siatka
     for week in days:
         r = []
-        for idx, d in enumerate(week):
+        for d in week:
             if d == 0:
                 r.append(InlineKeyboardButton(" ", callback_data="noop"))
             else:
                 ds = to_ddmmyyyy(date(year, month, d))
                 r.append(InlineKeyboardButton(str(d), callback_data=f"day:{ds}"))
         rows.append(r)
-    # nawigacja
     prev_month = (date(year, month, 1) - timedelta(days=1))
     next_month = (date(year, month, cal.monthrange(year, month)[1]) + timedelta(days=1))
     rows.append([
@@ -533,29 +472,24 @@ def month_kb(year: int, month: int) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(rows)
 
-
 # ──────────────────── handlery menu/top-level ────────────────────
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
-    context.user_data["msg_ids"] = set()
     sel_date = today_str()
     context.user_data["date"] = sel_date
     uid = update.effective_user.id
     await sticky_set(update, context, "Wybierz opcję:", build_main_menu(uid, sel_date))
 
-
 async def change_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    # pokaż kalendarz bieżącego miesiąca
+    await safe_answer(query)
     now = datetime.now()
     await sticky_set(update, context, "📅 Wybierz datę:", month_kb(now.year, now.month))
     return DATE_PICK
 
-
 async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data
     if data.startswith("cal:"):
         y, m = map(int, data.split(":")[1].split("-"))
@@ -568,14 +502,11 @@ async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     return DATE_PICK
 
-
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /export [YYYY-MM] lub przycisk z menu (bez paramów → bieżący miesiąc z user_data)
     month_arg = None
     if update.callback_query and update.callback_query.data == "export":
         month_arg = month_key_from_date(context.user_data.get("date", today_str()))
     else:
-        # z komendy
         args = getattr(context, "args", []) or []
         month_arg = args[0] if args else month_key_from_date(today_str())
 
@@ -596,9 +527,7 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     return ConversationHandler.END
 
-
 async def myexport_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /myexport [YYYY-MM] lub przycisk z menu
     month_arg = None
     if update.callback_query and update.callback_query.data == "myexport":
         month_arg = month_key_from_date(context.user_data.get("date", today_str()))
@@ -618,7 +547,6 @@ async def myexport_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     return ConversationHandler.END
-
 
 def export_month(month_key: str, user_id: Optional[int] = None) -> Optional[str]:
     if not os.path.exists(EXCEL_FILE):
@@ -643,15 +571,13 @@ def export_month(month_key: str, user_id: Optional[int] = None) -> Optional[str]
         return tmpf
     return _with_lock(_exp)
 
-
 # ──────────────────── FLOW: CREATE ────────────────────
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data
 
     if data in {"export", "myexport"}:
-        # obsłużą dedykowane handlery
         return
 
     date_str = context.user_data.get("date", today_str())
@@ -661,7 +587,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     if data == "create":
-        # pokaż presety miejsc
         places = get_recent_places(query.from_user.id)
         kb = []
         if places:
@@ -684,13 +609,11 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await sticky_set(update, context, "Wybierz pozycję do edycji:", InlineKeyboardMarkup(kb_rows))
         return SELECT_ENTRY
 
-
-# PLACE: obsługa presetów i wpisu ręcznego
+# PLACE
 async def place(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # jeśli to callback z presetem
     if update.callback_query:
         q = update.callback_query
-        await q.answer()
+        await safe_answer(q)
         if q.data.startswith("place_preset:"):
             idx = int(q.data.split(":")[1])
             places = get_recent_places(q.from_user.id)
@@ -703,7 +626,6 @@ async def place(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return PLACE
         return PLACE
 
-    # wiadomość tekstowa
     try:
         await update.message.delete()
     except Exception:
@@ -715,7 +637,6 @@ async def place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["place"] = place_txt
     await sticky_set(update, context, "⏰ Podaj godzinę rozpoczęcia pracy (HH:MM):")
     return START_TIME
-
 
 async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -731,7 +652,6 @@ async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sticky_set(update, context, "⏰ Podaj godzinę zakończenia pracy (HH:MM):")
     return END_TIME
 
-
 async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.delete()
@@ -741,7 +661,6 @@ async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not t or t <= context.user_data.get("start"):
         await sticky_set(update, context, "⏰ Błędna godzina. Spróbuj ponownie.")
         return END_TIME
-    # walidacja nakładania
     uid = context.user_data.get("uid")
     date_str = context.user_data.get("date", today_str())
     start = context.user_data.get("start")
@@ -757,55 +676,20 @@ async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return OVERLAP_DECIDE
 
     context.user_data["end"] = t
-    # pokaż szablony zadań
-    templates = get_task_templates(uid)
-    kb = []
-    if templates:
-        for i, tplt in enumerate(templates):
-            label = tplt[:40] + ("…" if len(tplt) > 40 else "")
-            kb.append([InlineKeyboardButton(label, callback_data=f"tpl_task:{i}")])
-    kb.append([InlineKeyboardButton("Wpisz ręcznie", callback_data="tpl_manual")])
-    await sticky_set(update, context, "📝 Wybierz szablon zadań lub wpisz ręcznie:", InlineKeyboardMarkup(kb))
+    await sticky_set(update, context, "📝 Wyślij listę zadań (tekst):")
     return TASKS
-
 
 async def overlap_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await safe_answer(q)
     if q.data == "overlap_ok":
         context.user_data["end"] = context.user_data.pop("pending_end")
-        # przejdź do wyboru zadań
-        templates = get_task_templates(context.user_data.get("uid"))
-        kb = []
-        if templates:
-            for i, tplt in enumerate(templates):
-                label = tplt[:40] + ("…" if len(tplt) > 40 else "")
-                kb.append([InlineKeyboardButton(label, callback_data=f"tpl_task:{i}")])
-        kb.append([InlineKeyboardButton("Wpisz ręcznie", callback_data="tpl_manual")])
-        await sticky_set(update, context, "📝 Wybierz szablon zadań lub wpisz ręcznie:", InlineKeyboardMarkup(kb))
+        await sticky_set(update, context, "📝 Wyślij listę zadań (tekst):")
         return TASKS
-    # popraw godziny
     await sticky_set(update, context, "⏰ Podaj godzinę rozpoczęcia pracy (HH:MM):")
     return START_TIME
 
-
 async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # obsługa wyboru szablonu
-    if update.callback_query:
-        q = update.callback_query
-        await q.answer()
-        if q.data.startswith("tpl_task:"):
-            idx = int(q.data.split(":")[1])
-            templates = get_task_templates(q.from_user.id)
-            if idx < len(templates):
-                context.user_data["tasks"] = templates[idx]
-                await sticky_set(update, context, "💬 Dodaj uwagi lub wpisz '-' jeśli brak:")
-                return NOTES
-        elif q.data == "tpl_manual":
-            await sticky_set(update, context, "📝 Wyślij listę zadań (tekst):")
-            return TASKS
-        return TASKS
-
     try:
         await update.message.delete()
     except Exception:
@@ -817,7 +701,6 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tasks"] = txt
     await sticky_set(update, context, "💬 Dodaj uwagi lub wpisz '-' jeśli brak:")
     return NOTES
-
 
 async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -838,9 +721,8 @@ async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     context.user_data.setdefault("entries", []).append(entry)
 
-    # zapamiętaj presety
+    # zapamiętaj presety MIEJSC
     remember_place(context.user_data.get("uid"), entry["place"])
-    remember_tasks(context.user_data.get("uid"), entry["tasks"])
 
     kb = [
         [InlineKeyboardButton("➕ Dodaj kolejne miejsce", callback_data="again")],
@@ -849,13 +731,11 @@ async def notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sticky_set(update, context, "Co dalej?", InlineKeyboardMarkup(kb))
     return ANOTHER
 
-
 async def another(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     if query.data == "again":
-        # powrót do miejsca z presetami
         places = get_recent_places(query.from_user.id)
         kb = []
         if places:
@@ -864,7 +744,6 @@ async def another(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await sticky_set(update, context, "📍 Podaj miejsce wykonywania pracy:", InlineKeyboardMarkup(kb))
         return PLACE
 
-    # finish → usuń sticky i pokaż finalny raport
     chat_id = query.message.chat.id
 
     save_report(
@@ -886,17 +765,16 @@ async def another(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 # ────────────── FLOW: EDIT ──────────────
 async def select_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     if query.data == "cancel_edit":
         await sticky_set(update, context, "Anulowano edycję.")
         return ConversationHandler.END
 
-    idx = int(query.data.split(":" )[1])  # entry:{idx}
+    idx = int(query.data.split(":" )[1])
     context.user_data["edit_idx"] = idx
     e = context.user_data["edit_entries"][idx]
 
@@ -911,10 +789,9 @@ async def select_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sticky_set(update, context, f"Wybrano: #{idx+1} {e['place']} {e['start']}-{e['end']}\nCo edytować?", InlineKeyboardMarkup(kb))
     return SELECT_FIELD
 
-
 async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     if query.data == "back_to_entries":
         entries = context.user_data.get("edit_entries", [])
@@ -940,7 +817,6 @@ async def select_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sticky_set(update, context, prompt)
     return EDIT_VALUE
 
-
 async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.delete()
@@ -965,8 +841,7 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if start and end and start >= end:
             await sticky_set(update, context, "⏰ Start musi być < koniec.")
             return EDIT_VALUE
-        # sprawdź nakładanie z innymi wpisami
-        overlap, conflicts = has_overlap(uid, date_str, start, end, exclude_rid=e["rid"]) 
+        overlap, conflicts = has_overlap(uid, date_str, start, end, exclude_rid=e["rid"])
         if overlap:
             await sticky_set(update, context, "⚠️ Przedziały czasu nakładają się: " + ", ".join([f"{a}-{b}" for a,b in conflicts]) + ". Zmień godziny.")
             return EDIT_VALUE
@@ -978,7 +853,6 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await sticky_set(update, context, f"❌ Błąd zapisu: {ex}")
         return EDIT_VALUE
 
-    # odśwież lokalny cache wpisów
     context.user_data["edit_entries"] = read_entries_for_day(uid, date_str)
 
     kb = [
@@ -989,10 +863,9 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sticky_set(update, context, "Zmieniono. Edytować coś jeszcze?", InlineKeyboardMarkup(kb))
     return EDIT_MORE
 
-
 async def edit_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
 
     if query.data == "again_same":
         idx = context.user_data.get("edit_idx")
@@ -1018,7 +891,6 @@ async def edit_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await sticky_set(update, context, "Wybierz pozycję:", InlineKeyboardMarkup(kb_rows))
         return SELECT_ENTRY
 
-    # finish_edit → usuń sticky i pokaż gotowy raport z podsumowaniami
     chat_id = query.message.chat.id
     date_str = context.user_data.get("date", today_str())
     uid = context.user_data.get("uid")
@@ -1035,7 +907,6 @@ async def edit_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await sticky_delete(context, update.effective_chat.id)
@@ -1045,12 +916,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(
-        "Użyj /start aby otworzyć menu. W menu: zmiana daty (kalendarz), tworzenie, edycja, eksporty. Tworzenie ma presety miejsc i szablony zadań. Walidacja nakładania godzin. Po zakończeniu pokazuję sumy dzienne i tygodniowe."
+        "Użyj /start aby otworzyć menu. W menu: zmiana daty (kalendarz), "
+        "tworzenie, edycja, eksporty. Tworzenie ma presety miejsc. "
+        "Walidacja nakładania godzin. Po zakończeniu pokazuję sumy dzienne i tygodniowe."
     )
 
+# ──────────────────── error handler ────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, BadRequest) and "query is too old" in str(err).lower():
+        return
+    logging.exception("Unhandled exception: %s", err)
 
 # ──────────────────── PTB Application ────────────────────
 async def on_startup(app: Application) -> None:
@@ -1060,7 +938,6 @@ async def on_startup(app: Application) -> None:
         BotCommand("myexport", "Mój eksport: /myexport YYYY-MM"),
         BotCommand("help", "Pomoc"),
     ])
-
 
 def build_app() -> Application:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
@@ -1079,27 +956,24 @@ def build_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_handler, pattern=r"^(create|edit|export|myexport)$")],
         states={
-            # date pick
             DATE_PICK: [CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$")],
-            # tworzenie
             PLACE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, place),
                 CallbackQueryHandler(place, pattern=r"^(place_preset:\d+|place_manual)$"),
             ],
             START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
-            END_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
+            END_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
             OVERLAP_DECIDE: [CallbackQueryHandler(overlap_decide, pattern=r"^(overlap_ok|overlap_fix)$")],
             TASKS: [
+                # tylko tekst – bez presetów zadań
                 MessageHandler(filters.TEXT & ~filters.COMMAND, tasks),
-                CallbackQueryHandler(tasks, pattern=r"^(tpl_task:\d+|tpl_manual)$"),
             ],
-            NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
+            NOTES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
             ANOTHER: [CallbackQueryHandler(another, pattern=r"^(again|finish)$")],
-            # edycja
             SELECT_ENTRY: [CallbackQueryHandler(select_entry, pattern=r"^(entry:\d+|cancel_edit)$")],
             SELECT_FIELD: [CallbackQueryHandler(select_field, pattern=r"^(field:(place|start|end|tasks|notes)|back_to_entries)$")],
-            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
-            EDIT_MORE: [CallbackQueryHandler(edit_more, pattern=r"^(again_same|again_other|finish_edit)$")],
+            EDIT_VALUE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+            EDIT_MORE:    [CallbackQueryHandler(edit_more, pattern=r"^(again_same|again_other|finish_edit)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_chat=True,
@@ -1107,8 +981,11 @@ def build_app() -> Application:
         per_message=False,
     )
     app.add_handler(conv)
-    return app
 
+    # globalny error handler
+    app.add_error_handler(error_handler)
+
+    return app
 
 # ──────────────────── main ────────────────────
 if __name__ == "__main__":
@@ -1120,7 +997,7 @@ if __name__ == "__main__":
     bot_app = build_app()
 
     if WEBHOOK_URL:
-        # produkcja – webhook (Northflank)
+        # produkcja – webhook (pamiętaj o pakiecie: pip install "python-telegram-bot[webhooks]")
         bot_app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
