@@ -2,5 +2,4 @@ python-telegram-bot==20.7
 openpyxl==3.1.5
 python-dotenv==1.0.1
 portalocker==2.8.2
-office365-rest-python-client==2.4.17  # opcjonalnie, jeśli używasz SharePoint22
 tzdata==2024.1
