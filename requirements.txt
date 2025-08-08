@@ -1,5 +1,6 @@
-python-telegram-bot==20.7
+python-telegram-bot[webhooks]==20.7
 openpyxl==3.1.5
 python-dotenv==1.0.1
-portalocker==2.8.2
+portalocker==2.8.2          # jeśli używasz wersji z lockiem/backupami
 tzdata==2024.1
+# (opcjonalnie) office365-rest-python-client==2.6.2   # tylko jeśli naprawdę używasz SharePoint
