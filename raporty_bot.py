@@ -1,4 +1,4 @@
-# ────────────────────────── raporty_bot.py (refactor 2025-08, sticky + lock + DATA_DIR + presets + calendar + exports + backups + validation + tags + summaries) ──────────────────────────
+
 import os
 import re
 import json
@@ -1048,13 +1048,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(
-        "Użyj /start aby otworzyć menu. W menu: zmiana daty (kalendarz), "
-        "tworzenie, edycja, eksporty. Tworzenie ma presety miejsc i szablony zadań. "
-        "Walidacja nakładania godzin. Po zakończeniu pokazuję sumy dzienne i tygodniowe."
+        "Użyj /start aby otworzyć menu. W menu: zmiana daty (kalendarz), tworzenie, edycja, eksporty. Tworzenie ma presety miejsc i szablony zadań. Walidacja nakładania godzin. Po zakończeniu pokazuję sumy dzienne i tygodniowe."
     )
 
 
-# ──────────────────── PTB Application2 ────────────────────
+# ──────────────────── PTB Application ────────────────────
 async def on_startup(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Otwórz menu raportów"),
@@ -1065,12 +1063,7 @@ async def on_startup(app: Application) -> None:
 
 
 def build_app() -> Application:
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(on_startup)
-        .build()
-    )
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
 
     # komendy
     app.add_handler(CommandHandler("start", show_menu))
@@ -1086,29 +1079,27 @@ def build_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_handler, pattern=r"^(create|edit|export|myexport)$")],
         states={
-            # wybór daty (kalendarz inline)
-            DATE_PICK: [
-                CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$")
-            ],
+            # date pick
+            DATE_PICK: [CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$")],
             # tworzenie
             PLACE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, place),
                 CallbackQueryHandler(place, pattern=r"^(place_preset:\d+|place_manual)$"),
             ],
             START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
-            END_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
+            END_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
             OVERLAP_DECIDE: [CallbackQueryHandler(overlap_decide, pattern=r"^(overlap_ok|overlap_fix)$")],
             TASKS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, tasks),
                 CallbackQueryHandler(tasks, pattern=r"^(tpl_task:\d+|tpl_manual)$"),
             ],
-            NOTES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
+            NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
             ANOTHER: [CallbackQueryHandler(another, pattern=r"^(again|finish)$")],
             # edycja
             SELECT_ENTRY: [CallbackQueryHandler(select_entry, pattern=r"^(entry:\d+|cancel_edit)$")],
             SELECT_FIELD: [CallbackQueryHandler(select_field, pattern=r"^(field:(place|start|end|tasks|notes)|back_to_entries)$")],
-            EDIT_VALUE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
-            EDIT_MORE:    [CallbackQueryHandler(edit_more, pattern=r"^(again_same|again_other|finish_edit)$")],
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+            EDIT_MORE: [CallbackQueryHandler(edit_more, pattern=r"^(again_same|again_other|finish_edit)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_chat=True,
@@ -1121,10 +1112,7 @@ def build_app() -> Application:
 
 # ──────────────────── main ────────────────────
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 
     if not TELEGRAM_TOKEN:
         raise SystemExit("Brak TELEGRAM_TOKEN w env.")
