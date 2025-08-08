@@ -1054,7 +1054,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ──────────────────── PTB Application ────────────────────
+# ──────────────────── PTB Application2 ────────────────────
 async def on_startup(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Otwórz menu raportów"),
