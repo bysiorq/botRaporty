@@ -1,4 +1,4 @@
-# ────────────────────────── raporty_bot.py (refactor 2025-08; sticky + lock fix + DATA_DIR + presets(miejsca) + calendar + exports + backups + validation + tags + summaries + safe_answer) ──────────────────────────
+# ────────────────────────── raporty_bot.py (refactor 2025-08; FIX: export callbacks outside conversation; sticky + lock fix + DATA_DIR + presets(miejsca) + calendar + exports + backups + validation + tags + summaries + safe_answer) ──────────────────────────
 import os
 import re
 import json
@@ -50,6 +50,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # MUST HAVE
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # np. https://app-xyz.northflank.app
 PORT = int(os.getenv("PORT", 8080))  # Northflank zwykle 8080
 
+# 👉 WAŻNE: Ustaw DATA_DIR na trwały wolumen (np. /data) w Northflank, aby nie tracić plików po redeploy.
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -280,7 +281,10 @@ def _maybe_upload_sharepoint() -> None:
 def load_mapping() -> Dict[str, int]:
     if os.path.exists(MAPPING_FILE):
         with open(MAPPING_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
     return {}
 
 def save_mapping(mapping: Dict[str, int]) -> None:
@@ -503,6 +507,10 @@ async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return DATE_PICK
 
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # obsługa zarówno z /export jak i z przycisku
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+
     month_arg = None
     if update.callback_query and update.callback_query.data == "export":
         month_arg = month_key_from_date(context.user_data.get("date", today_str()))
@@ -528,6 +536,10 @@ async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def myexport_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # obsługa zarówno z /myexport jak i z przycisku
+    if update.callback_query:
+        await safe_answer(update.callback_query)
+
     month_arg = None
     if update.callback_query and update.callback_query.data == "myexport":
         month_arg = month_key_from_date(context.user_data.get("date", today_str()))
@@ -577,8 +589,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(query)
     data = query.data
 
-    if data in {"export", "myexport"}:
-        return
+    # UWAGA: export/myexport są obsługiwane osobnymi handlerami (poza ConversationHandler)
 
     date_str = context.user_data.get("date", today_str())
     context.user_data.update({
@@ -926,6 +937,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ──────────────────── error handler ────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
+    if isinstance(err, BadRequest) and "query is not found" in str(err).lower():
+        return
     if isinstance(err, BadRequest) and "query is too old" in str(err).lower():
         return
     logging.exception("Unhandled exception: %s", err)
@@ -948,13 +961,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("myexport", myexport_handler))
     app.add_handler(CommandHandler("help", help_cmd))
 
-    # menu/top-level callbacks (poza conversation)
+    # top-level callbacks (poza ConversationHandler)
     app.add_handler(CallbackQueryHandler(change_date_cb, pattern=r"^change_date$"))
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
 
+    # 🔧 KLUCZOWE: eksporty jako osobne callbacki (żeby nie blokowały konwersacji)
+    app.add_handler(CallbackQueryHandler(export_handler, pattern=r"^export$"))
+    app.add_handler(CallbackQueryHandler(myexport_handler, pattern=r"^myexport$"))
+
     # conversation
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler, pattern=r"^(create|edit|export|myexport)$")],
+        # entry tylko dla create|edit (export/myexport wyjęte na zewnątrz)
+        entry_points=[CallbackQueryHandler(menu_handler, pattern=r"^(create|edit)$")],
         states={
             DATE_PICK: [CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$")],
             PLACE: [
@@ -965,7 +983,6 @@ def build_app() -> Application:
             END_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
             OVERLAP_DECIDE: [CallbackQueryHandler(overlap_decide, pattern=r"^(overlap_ok|overlap_fix)$")],
             TASKS: [
-                # tylko tekst – bez presetów zadań
                 MessageHandler(filters.TEXT & ~filters.COMMAND, tasks),
             ],
             NOTES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, notes)],
