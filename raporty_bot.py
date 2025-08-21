@@ -1,13 +1,15 @@
 # ────────────────────────── raporty_bot.py
-# Panel jednowiadomościowy (single-message UI) jak u BotFather – pełna, spójna wersja:
-# - jedna wiadomość „panel” (editMessageText), nawigacja wstecz (view stack)
-# - brak „promptów” – panel prosi o dane; tekst od użytkownika jest kasowany i panel aktualizowany
-# - picker czasu HH/MM z kropkami (●/○), czytelne odstępy, 00 minut domyślnie; w edycji preselektuje poprzednią wartość
-# - baner „✍️ Oczekuję na tekst …” po wciśnięciu Zadania/Uwagi/Miejsce manual
-# - eksporty naprawione (działają z przycisku i komend)
-# - możliwość dodawania nowej pozycji także z panelu edycji (↔ powrót po zapisie)
-# - Excel: lock, backupy, opcjonalny SharePoint
-# - pamiętaj o trwałym wolumenie: DATA_DIR=/data
+# Jednowiadomościowy „panel” jak u BotFather – wersja poprawiona przez senior dev:
+# ✔️ Widoczny raport dnia już na /start (jeśli istnieje) + blokada tworzenia nowego przy istniejącym
+# ✔️ Kropki (●) przy „Zadania” i „Uwagi” oraz w samym panelu – jasna informacja o aktywnym trybie wprowadzania tekstu
+# ✔️ „Zapisz do Excela” automatycznie doda bieżącą pozycję (jeśli kompletna), nie wymaga wciskania „Dodaj pozycję”
+# ✔️ Pełna weryfikacja nakładania godzin (z pozycjami w panelu i zapisanymi w Excelu)
+# ✔️ Time picker: 00 minut domyślnie, w edycji pre-selekcja aktualnej wartości
+# ✔️ Emoji w panelu edycji, możliwość dodania nowej pozycji z panelu edycji
+# ✔️ Presety miejsc (pobierane prawidłowo per użytkownik)
+# ✔️ Eksport z przycisków i komend – nie blokuje UI
+# ✔️ Locki, backupy, opcjonalny upload do SharePoint
+# ⚠️ Trwałość danych: ustaw DATA_DIR=/data i podłącz wolumen w Northflank
 
 import os
 import re
@@ -60,21 +62,21 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # MUST HAVE
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # np. https://app-xyz.northflank.app
 PORT = int(os.getenv("PORT", 8080))  # Northflank zwykle 8080
 
-# 👉 Ustaw DATA_DIR na trwały wolumen (np. /data) w Northflank, by nie tracić danych po redeploy.
+# ⚠️ Podłącz trwały wolumen w Northflank i ustaw DATA_DIR=/data
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "20"))
 
-# opcjonalne ustawienia SharePoint
+# opcjonalne SharePoint
 SHAREPOINT_SITE = os.getenv("SHAREPOINT_SITE")
 SHAREPOINT_DOC_LIB = os.getenv("SHAREPOINT_DOC_LIB")
 SHAREPOINT_CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
 SHAREPOINT_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
 
 EXCEL_FILE = os.path.join(DATA_DIR, "reports.xlsx")
-MAPPING_FILE = os.path.join(DATA_DIR, "report_msgs.json")  # zachowane opcjonalnie
+MAPPING_FILE = os.path.join(DATA_DIR, "report_msgs.json")
 PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
 LOCK_FILE = os.path.join(DATA_DIR, "reports.lock")
 
@@ -82,7 +84,7 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().
 
 # ──────────────────── stałe excela ────────────────────
 HEADERS = [
-    "ID",        # unikalny klucz: {user_id}_{dd.mm.YYYY}_{idx}
+    "ID",        # {user_id}_{dd.mm.YYYY}_{idx}
     "Data",
     "Imię",
     "Miejsce",
@@ -91,7 +93,7 @@ HEADERS = [
     "Zadania",
     "Uwagi",
 ]
-COLS = {name: i + 1 for i, name in enumerate(HEADERS)}  # 1-based indexy
+COLS = {name: i + 1 for i, name in enumerate(HEADERS)}  # 1-based
 
 # ──────────────────── stany ────────────────────
 DATE_PICK = 10
@@ -283,7 +285,7 @@ def _maybe_upload_sharepoint() -> None:
         except Exception as e:
             logging.warning("SharePoint upload failed: %s", e)
 
-# ──────────────────── helpers: mapping/presets(utils) ────────────────────
+# ──────────────────── presets (miejsca) ────────────────────
 def load_mapping() -> Dict[str, int]:
     if os.path.exists(MAPPING_FILE):
         with open(MAPPING_FILE, "r", encoding="utf-8") as f:
@@ -327,13 +329,6 @@ def get_recent_places(user_id: int) -> List[str]:
     return presets.get(str(user_id), {}).get("places", [])
 
 # ──────────────────── helpers: time/tags/overlap ────────────────────
-def parse_time(text: str) -> Optional[str]:
-    try:
-        t = datetime.strptime(text.strip(), "%H:%M")
-        return t.strftime("%H:%M")
-    except Exception:
-        return None
-
 def time_to_minutes(t: str) -> int:
     h, m = map(int, t.split(":"))
     return h * 60 + m
@@ -365,20 +360,6 @@ def compute_daily_minutes(entries: List[Dict[str, str]]) -> int:
     total = 0
     for e in entries:
         if e.get("start") and e.get("end"):
-            total += time_to_minutes(e["end"]) - time_to_minutes(e["start"])
-    return total
-
-def compute_week_minutes(user_id: int, any_date_ddmmYYYY: str) -> int:
-    d = datetime.strptime(any_date_ddmmYYYY, "%d.%m.%Y").date()
-    iso_year, iso_week, _ = d.isocalendar()
-    total = 0
-    for e in read_entries_all_weeks(user_id):
-        try:
-            ed = datetime.strptime(e["date"], "%d.%m.%Y").date()
-        except Exception:
-            continue
-        y, w, _ = ed.isocalendar()
-        if (y, w) == (iso_year, iso_week) and e["start"] and e["end"]:
             total += time_to_minutes(e["end"]) - time_to_minutes(e["start"])
     return total
 
@@ -445,14 +426,43 @@ def today_str() -> str:
 def to_ddmmyyyy(d: date) -> str:
     return d.strftime("%d.%m.%Y")
 
+def format_home(uid: int, date_str: str, name: str) -> str:
+    lines = [f"👤 {name} | 📅 {date_str}"]
+    exists = report_exists(uid, date_str)
+    if exists:
+        entries = read_entries_for_day(uid, date_str)
+        lines.append("\n📄 *Raport na dziś:*")
+        for i, e in enumerate(entries, start=1):
+            lines.extend([
+                f"#{i} • 📍 {e['place']} • ⏰ {e['start']}-{e['end']}",
+                f"📝 {e['tasks'] or '-'}",
+                f"💬 {e['notes'] or '-'}",
+                ""
+            ])
+        total = compute_daily_minutes(entries)
+        if total:
+            lines.append(f"⏳ Suma: {minutes_to_hhmm(total)}")
+    else:
+        lines.append("\nℹ️ Brak raportu dla tej daty.")
+    lines.append("\nWybierz czynność ⬇️")
+    return "\n".join(lines)
+
 def build_main_menu(uid: int, date_str: str) -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(f"📅 Data: {date_str}", callback_data="date:open")],
-        [InlineKeyboardButton("📋 Twórz raport", callback_data="panel:create"),
-         InlineKeyboardButton("✏️ Edytuj raport", callback_data="panel:edit")],
-        [InlineKeyboardButton("📥 Eksport", callback_data="export"),
-         InlineKeyboardButton("📥 Mój eksport", callback_data="myexport")],
-    ]
+    exists = report_exists(uid, date_str)
+    if exists:
+        kb = [
+            [InlineKeyboardButton(f"📅 Data: {date_str}", callback_data="date:open")],
+            [InlineKeyboardButton("✏️ Edytuj raport", callback_data="panel:edit")],
+            [InlineKeyboardButton("📥 Eksport", callback_data="export"),
+             InlineKeyboardButton("📥 Mój eksport", callback_data="myexport")],
+        ]
+    else:
+        kb = [
+            [InlineKeyboardButton(f"📅 Data: {date_str}", callback_data="date:open")],
+            [InlineKeyboardButton("📋 Twórz raport", callback_data="panel:create")],
+            [InlineKeyboardButton("📥 Eksport", callback_data="export"),
+             InlineKeyboardButton("📥 Mój eksport", callback_data="myexport")],
+        ]
     return InlineKeyboardMarkup(kb)
 
 def month_kb(year: int, month: int) -> InlineKeyboardMarkup:
@@ -483,24 +493,17 @@ def month_kb(year: int, month: int) -> InlineKeyboardMarkup:
 def placeholder(val: Optional[str]) -> str:
     return val if (val is not None and str(val).strip() != "") else "—"
 
-def _await_banner(context: ContextTypes.DEFAULT_TYPE) -> str:
-    aw = context.user_data.get("await")
-    if not aw:
-        return ""
-    field = aw.get("field")
-    names = {"place": "Miejsce", "tasks": "Zadania", "notes": "Uwagi"}
-    return f"✍️ *Oczekuję na tekst*: {names.get(field, field)} — wyślij wiadomość, zostanie usunięta.\n"
-
 def panel_create_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     name = context.user_data.get("name", "")
     date_str = context.user_data.get("date", today_str())
     cur = context.user_data.setdefault("current_entry", {})
     entries = context.user_data.get("entries", [])
-    lines = []
-    banner = _await_banner(context)
-    if banner:
-        lines.append(banner)
-    lines.extend([
+    aw = context.user_data.get("await") or {}
+
+    dot_tasks = " (●)" if aw.get("field") == "tasks" and aw.get("mode") == "create" else ""
+    dot_notes = " (●)" if aw.get("field") == "notes" and aw.get("mode") == "create" else ""
+
+    lines = [
         f"📄 Panel: *Tworzenie raportu*",
         f"👤 Imię: {name}",
         f"📅 Data: {date_str}",
@@ -508,29 +511,32 @@ def panel_create_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"📍 Miejsce: {placeholder(cur.get('place'))}",
         f"⏰ Start: {placeholder(cur.get('start'))}",
         f"⏰ Koniec: {placeholder(cur.get('end'))}",
-        "📝 Zadania:",
+        f"📝 Zadania{dot_tasks}:",
         f"{placeholder(cur.get('tasks'))}",
-        "💬 Uwagi:",
+        f"💬 Uwagi{dot_notes}:",
         f"{placeholder(cur.get('notes'))}",
         "",
-        f"➕ Pozycje w tym panelu (jeszcze nie zapisane do Excela): {len(entries)}",
-    ])
+        f"➕ Pozycje w panelu (niezapisane): {len(entries)}",
+    ]
     mins = compute_daily_minutes(entries + ([cur] if cur.get("start") and cur.get("end") else []))
     if mins:
         lines.append(f"⏳ Razem (panel): {minutes_to_hhmm(mins)}")
     lines.append("")
-    lines.append("Wybierz czynność poniżej ⬇️")
+    lines.append("Wybierz czynność ⬇️")
     return "\n".join(lines)
 
 def kb_create(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     back_label = "↩️ Do edycji" if context.user_data.get("from_edit") else "↩️ Wstecz"
     back_cb = "nav:editlist" if context.user_data.get("from_edit") else "nav:home"
+    aw = context.user_data.get("await") or {}
+    t_lbl = "📝 Zadania (tekst)" + (" ●" if aw.get("field") == "tasks" and aw.get("mode") == "create" else "")
+    n_lbl = "💬 Uwagi (tekst)" + (" ●" if aw.get("field") == "notes" and aw.get("mode") == "create" else "")
     kb = [
         [InlineKeyboardButton("📍 Miejsce", callback_data="set:place"),
          InlineKeyboardButton("⏰ Start", callback_data="set:start"),
          InlineKeyboardButton("⏰ Koniec", callback_data="set:end")],
-        [InlineKeyboardButton("📝 Zadania (tekst)", callback_data="set:tasks"),
-         InlineKeyboardButton("💬 Uwagi (tekst)", callback_data="set:notes")],
+        [InlineKeyboardButton(t_lbl, callback_data="set:tasks"),
+         InlineKeyboardButton(n_lbl, callback_data="set:notes")],
         [InlineKeyboardButton("➕ Dodaj pozycję", callback_data="create:add"),
          InlineKeyboardButton("🗑️ Wyczyść pola", callback_data="create:clear")],
         [InlineKeyboardButton("✅ Zakończ raport (zapis do Excela)", callback_data="create:finish")],
@@ -543,11 +549,7 @@ def panel_edit_list_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     uid = context.user_data.get("uid")
     entries = read_entries_for_day(uid, date_str)
     context.user_data["edit_entries"] = entries
-    banner = _await_banner(context)
-    lines = []
-    if banner:
-        lines.append(banner)
-    lines.append(f"✏️ Panel: *Edycja raportu* — {date_str}\n")
+    lines = [f"✏️ Panel: *Edycja raportu* — {date_str}\n"]
     if not entries:
         lines.append("Brak wpisów dla tej daty.")
     else:
@@ -558,7 +560,10 @@ def panel_edit_list_text(context: ContextTypes.DEFAULT_TYPE) -> str:
                 f"💬 {e['notes'] or '-'}",
                 ""
             ])
-    lines.append("Wybierz pozycję do edycji lub dodaj nową.")
+        total = compute_daily_minutes(entries)
+        if total:
+            lines.append(f"⏳ Suma: {minutes_to_hhmm(total)}")
+    lines.append("\nWybierz pozycję do edycji lub dodaj nową.")
     return "\n".join(lines)
 
 def kb_edit_list(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
@@ -574,31 +579,34 @@ def kb_edit_list(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
 def panel_edit_entry_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     idx = context.user_data.get("edit_idx")
     e = context.user_data.get("edit_entries", [])[idx]
-    banner = _await_banner(context)
-    lines = []
-    if banner:
-        lines.append(banner)
-    lines.extend([
+    # kropki dla aktywnego pola w edycji
+    aw = context.user_data.get("await") or {}
+    dot_tasks = " (●)" if aw.get("field") == "tasks" and aw.get("mode") == "edit" else ""
+    dot_notes = " (●)" if aw.get("field") == "notes" and aw.get("mode") == "edit" else ""
+    lines = [
         f"✏️ *Edycja pozycji* #{idx+1}",
         f"📍 Miejsce: {e['place']}",
         f"⏰ Start: {e['start']}",
         f"⏰ Koniec: {e['end']}",
-        "📝 Zadania:",
+        f"📝 Zadania{dot_tasks}:",
         f"{e['tasks'] or '-'}",
-        "💬 Uwagi:",
+        f"💬 Uwagi{dot_notes}:",
         f"{e['notes'] or '-'}",
         "",
         "Co chcesz zmienić?"
-    ])
+    ]
     return "\n".join(lines)
 
 def kb_edit_entry(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    aw = context.user_data.get("await") or {}
+    t_lbl = "📝 Zadania" + (" ●" if aw.get("field") == "tasks" and aw.get("mode") == "edit" else "")
+    n_lbl = "💬 Uwagi" + (" ●" if aw.get("field") == "notes" and aw.get("mode") == "edit" else "")
     kb = [
         [InlineKeyboardButton("📍 Miejsce", callback_data="editf:place")],
         [InlineKeyboardButton("⏰ Start", callback_data="editf:start"),
          InlineKeyboardButton("⏰ Koniec", callback_data="editf:end")],
-        [InlineKeyboardButton("📝 Zadania", callback_data="editf:tasks"),
-         InlineKeyboardButton("💬 Uwagi", callback_data="editf:notes")],
+        [InlineKeyboardButton(t_lbl, callback_data="editf:tasks"),
+         InlineKeyboardButton(n_lbl, callback_data="editf:notes")],
         [InlineKeyboardButton("↩️ Lista pozycji", callback_data="nav:editlist")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -607,14 +615,12 @@ def time_kb(selection: dict, back_to: str) -> InlineKeyboardMarkup:
     h = selection.get("h")
     m = selection.get("m")
     rows = []
-    # godziny 0-23, 4 wiersze po 6
     for base in [0, 6, 12, 18]:
         row = []
         for x in range(base, min(base+6, 24)):
             mark = "●" if h == x else "○"
             row.append(InlineKeyboardButton(f"{mark} {x:02d}", callback_data=f"t:h:{x:02d}"))
         rows.append(row)
-    # minuty: 00/15/30/45
     rowm = []
     for mm in [0, 15, 30, 45]:
         mark = "●" if m == mm else "○"
@@ -628,11 +634,13 @@ def time_kb(selection: dict, back_to: str) -> InlineKeyboardMarkup:
 # ──────────────────── centralny renderer ────────────────────
 async def render(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
     v = top_view(context)
+    uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
+           else update_or_ctx.callback_query.from_user.id)
+    name = context.user_data.get("name", "")
+    ds = context.user_data.get("date", today_str())
+
     if not v or v.name == "home":
-        uid = (update_or_ctx.effective_user.id if isinstance(update_or_ctx, Update)
-               else update_or_ctx.callback_query.from_user.id)
-        ds = context.user_data.get("date", today_str())
-        await sticky_set(update_or_ctx, context, "Wybierz opcję:", build_main_menu(uid, ds))
+        await sticky_set(update_or_ctx, context, format_home(uid, ds, name), build_main_menu(uid, ds))
         return
 
     if v.name == "calendar":
@@ -653,16 +661,17 @@ async def render(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if v.name == "place_select_create":
-        await sticky_set(update_or_ctx, context, "📍 Wybierz miejsce:", kb_place_select(context="create"))
+        uid = context.user_data.get("uid")
+        await sticky_set(update_or_ctx, context, "📍 Wybierz miejsce:", kb_place_select("create", uid))
         return
 
     if v.name == "place_select_edit":
-        await sticky_set(update_or_ctx, context, "📍 Wybierz nowe miejsce:", kb_place_select(context="edit"))
+        uid = context.user_data.get("uid")
+        await sticky_set(update_or_ctx, context, "📍 Wybierz nowe miejsce:", kb_place_select("edit", uid))
         return
 
     if v.name == "time_pick":
-        sel = context.user_data.get("time_edit", {"h": None, "m": None})
-        # tytuł z podglądem wyboru
+        sel = context.user_data.get("time_edit", {"h": None, "m": 0})
         hh = "--" if sel.get("h") is None else f"{sel['h']:02d}"
         mm = "--" if sel.get("m") is None else f"{sel['m']:02d}"
         title = f"⏰ Ustaw czas (HH:MM)\nWybrane: {hh}:{mm}"
@@ -670,21 +679,18 @@ async def render(update_or_ctx, context: ContextTypes.DEFAULT_TYPE):
         await sticky_set(update_or_ctx, context, title, time_kb(sel, back_to=back_to))
         return
 
-def kb_place_select(context: str) -> InlineKeyboardMarkup:
-    # context: "create" lub "edit"
+def kb_place_select(context_kind: str, uid: int) -> InlineKeyboardMarkup:
     def _rows(user_places: List[str]) -> List[List[InlineKeyboardButton]]:
         rows = []
         for i, p in enumerate(user_places):
             rows.append([InlineKeyboardButton(p, callback_data=f"place_preset:{i}")])
         rows.append([InlineKeyboardButton("✍️ Wpisz ręcznie (wyślij tekst)", callback_data="place_manual")])
-        if context == "create":
+        if context_kind == "create":
             rows.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:create")])
         else:
             rows.append([InlineKeyboardButton("↩️ Wstecz", callback_data="nav:editentry")])
         return rows
-
-    # to będzie uzupełnione w handlerze (potrzebny uid z context)
-    return InlineKeyboardMarkup(_rows(get_recent_places(0)))
+    return InlineKeyboardMarkup(_rows(get_recent_places(uid)))
 
 # ──────────────────── top-level handlers ────────────────────
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,12 +708,19 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await safe_answer(q)
+    uid = q.from_user.id
+    ds = context.user_data.get("date", today_str())
     if q.data == "date:open":
         now = datetime.now()
         push_view(context, "calendar", year=now.year, month=now.month)
         await render(update, context)
         return
     if q.data == "panel:create":
+        if report_exists(uid, ds):
+            await safe_answer(q, text="Raport dla tej daty już istnieje. Przechodzę do edycji.", show_alert=False)
+            push_view(context, "edit_list")
+            await render(update, context)
+            return
         context.user_data.pop("from_edit", None)
         push_view(context, "create")
         await render(update, context)
@@ -730,8 +743,8 @@ async def calendar_nav_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("day:"):
         ds = data.split(":")[1]
         context.user_data["date"] = ds
-        pop_view(context)
-        push_view(context, "home")
+        # po wyborze daty wracamy do home (z przeglądem raportu dla tej daty)
+        context.user_data["view_stack"] = [View("home", {})]
         await render(update, context)
         return ConversationHandler.END
     return DATE_PICK
@@ -747,17 +760,14 @@ async def nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not top_view(context):
             context.user_data["view_stack"] = [View("home", {})]
     elif action == "create":
-        if not top_view(context) or top_view(context).name != "create":
-            push_view(context, "create")
+        push_view(context, "create")
     elif action == "editentry":
-        if not top_view(context) or top_view(context).name != "edit_entry":
-            push_view(context, "edit_entry")
+        push_view(context, "edit_entry")
     elif action == "editlist":
-        if not top_view(context) or top_view(context).name != "edit_list":
-            push_view(context, "edit_list")
+        push_view(context, "edit_list")
     await render(update, context)
 
-# ──────────────────── EXPORT (z przycisków i z komend) ────────────────────
+# ──────────────────── EXPORT ────────────────────
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await safe_answer(update.callback_query)
@@ -844,12 +854,10 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("set:"):
         field = data.split(":")[1]
         if field == "place":
-            # preset/manual wybór
             push_view(context, "place_select_create")
-            await sticky_set(update, context, "📍 Wybierz miejsce:", kb_place_select("create"))
+            await render(update, context)
             return
         if field in ("start", "end"):
-            # domyślnie minuty 00; jeśli już jest wartość – preselektuj
             cur = context.user_data.setdefault("current_entry", {})
             init_h = None
             init_m = 0
@@ -865,7 +873,8 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         if field in ("tasks", "notes"):
             context.user_data["await"] = {"mode": "create", "field": field}
-            await safe_answer(q, text="Wyślij teraz tekst. Zostanie zapisany i usunięty.", show_alert=False)
+            # nie pokazujemy banera u góry – używamy kropek przy przyciskach/sekcjach
+            await safe_answer(q, text="Wyślij teraz tekst (wiadomość zostanie usunięta).")
             await render(update, context)
             return
 
@@ -883,17 +892,19 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data == "place_manual":
         context.user_data["await"] = {"mode": "create", "field": "place"}
-        await safe_answer(q, text="Wyślij teraz nazwę miejsca. Wiadomość zostanie usunięta.")
+        await safe_answer(q, text="Wyślij teraz nazwę miejsca (wiadomość zostanie usunięta).")
         await render(update, context)
         return
 
-    # akcje na wpisach
+    # akcje: wyczyść / dodaj / finish
     if data == "create:clear":
         context.user_data["current_entry"] = {}
+        context.user_data.pop("await", None)
         await render(update, context)
         return
 
     if data == "create:add":
+        # walidacja + anti-overlap z panelem i Excelem
         cur = context.user_data.get("current_entry", {})
         missing = [k for k in ["place", "start", "end"] if not cur.get(k)]
         if missing:
@@ -919,6 +930,7 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.setdefault("entries", []).append(cur)
         remember_place(uid, cur["place"])
         context.user_data["current_entry"] = {}
+        context.user_data.pop("await", None)
         await safe_answer(q, text="Dodano pozycję.")
         await render(update, context)
         return
@@ -932,6 +944,7 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 remember_place(context.user_data.get("uid"), cur["place"])
                 context.user_data["current_entry"] = {}
             context.user_data.pop("pending_overlap", None)
+            context.user_data.pop("await", None)
             await render(update, context)
             return
         if action == "fix":
@@ -942,19 +955,34 @@ async def panel_create_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
     if data == "create:finish":
+        # Jeśli bieżąca pozycja kompletna – spróbuj dodać automatycznie (żeby nie wymagać „Dodaj pozycję”)
+        cur = context.user_data.get("current_entry", {})
+        if cur.get("place") and cur.get("start") and cur.get("end"):
+            if cur["start"] >= cur["end"]:
+                await safe_answer(q, text="Start musi być < koniec.", show_alert=True)
+                return
+            uid = context.user_data.get("uid")
+            date_str = context.user_data.get("date", today_str())
+            overlap, conflicts = has_overlap(uid, date_str, cur["start"], cur["end"], in_memory=context.user_data.get("entries", []))
+            if overlap:
+                await safe_answer(q, text="Bieżąca pozycja nakłada się czasowo – popraw godziny.", show_alert=True)
+                return
+            context.user_data.setdefault("entries", []).append(cur)
+            remember_place(uid, cur["place"])
+            context.user_data["current_entry"] = {}
+
         entries = context.user_data.get("entries", [])
         if not entries:
             await safe_answer(q, text="Brak pozycji do zapisania.", show_alert=True)
             return
+
+        # Zapis do Excela
         save_report(entries, context.user_data.get("uid"), context.user_data.get("date", today_str()), context.user_data.get("name"))
         context.user_data["entries"] = []
-        await safe_answer(q, text="Zapisano do Excela.")
-        # jeśli przyszliśmy z edycji – wróć do listy pozycji
-        if context.user_data.get("from_edit"):
-            context.user_data.pop("from_edit", None)
-            # odśwież listę i panel edycji
-            if not top_view(context) or top_view(context).name != "edit_list":
-                push_view(context, "edit_list")
+        context.user_data.pop("await", None)
+        await safe_answer(q, text="Zapisano raport do Excela.")
+        # wróć do ekranu głównego z podglądem raportu
+        context.user_data["view_stack"] = [View("home", {})]
         await render(update, context)
         return
 
@@ -990,10 +1018,9 @@ async def edit_entry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         field = data.split(":")[1]
         if field == "place":
             push_view(context, "place_select_edit")
-            await sticky_set(update, context, "📍 Wybierz nowe miejsce:", kb_place_select("edit"))
+            await render(update, context)
             return
         if field in ("start", "end"):
-            # preselektuj aktualny czas
             init_h = None
             init_m = 0
             try:
@@ -1009,7 +1036,7 @@ async def edit_entry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         if field in ("tasks", "notes"):
             context.user_data["await"] = {"mode": "edit", "field": field, "rid": e["rid"]}
-            await safe_answer(q, text="Wyślij teraz nowy tekst. Wiadomość zostanie usunięta.")
+            await safe_answer(q, text="Wyślij teraz nowy tekst (wiadomość zostanie usunięta).")
             await render(update, context)
             return
 
@@ -1140,10 +1167,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📘 *Pomoc*\n"
-        "• /start – otwiera panel.\n"
-        "• Panel to jedna wiadomość – wszystko przez przyciski.\n"
-        "• Teksty (miejsce/zadania/uwagi): po wciśnięciu przycisku wyślij wiadomość – zostanie usunięta i zapisane w panelu.\n"
-        "• Czas ustawiasz przyciskami HH i MM (00 preselektowane; w edycji wczytywana poprzednia wartość).\n"
+        "• /start – panel główny (z podglądem raportu, jeśli istnieje).\n"
+        "• Wprowadzanie tekstów (Miejsce/Zadania/Uwagi): wciśnij przycisk – obok pojawi się kropka (●) – wyślij wiadomość.\n"
+        "• Czas ustawiasz przyciskami HH/MM (00 min domyślnie, w edycji pre-selekcja).\n"
         "• Eksport: przyciski lub /export, /myexport.\n"
     )
     await sticky_set(update, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Wstecz", callback_data="nav:home")]]))
@@ -1178,7 +1204,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(calendar_nav_cb, pattern=r"^(cal:\d{4}-\d{2}|day:\d{2}\.\d{2}\.\d{4})$"))
     app.add_handler(CallbackQueryHandler(nav_handler, pattern=r"^nav:(home|back|create|editentry|editlist)$"))
 
-    # eksporty jako osobne callbacki (fix „loading”)
+    # eksporty – osobne callbacki
     app.add_handler(CallbackQueryHandler(export_handler, pattern=r"^export$"))
     app.add_handler(CallbackQueryHandler(myexport_handler, pattern=r"^myexport$"))
 
@@ -1192,7 +1218,7 @@ def build_app() -> Application:
     # time picker
     app.add_handler(CallbackQueryHandler(time_pick_handler, pattern=r"^(t:(h|m):\d{2}|t:(ok|cancel))$"))
 
-    # await text – zawsze kasujemy i aktualizujemy panel
+    # await text – kasujemy i odświeżamy panel
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, await_text_handler))
 
     # globalny error handler
